@@ -12,11 +12,12 @@ exit /b %errorlevel%
 #  TTPU Lab - work on your lab repo in local VS Code on a shared PC.
 #
 #  Double-click to START a lab session:
-#    1. Removes old GitHub logins from this PC.
-#    2. You sign in to GitHub once (private browser window, one code).
-#    3. Downloads (clones) your lab repo and opens it in VS Code.
-#    4. When you close VS Code: saves your work to GitHub (commit and
-#       push) and removes your login from this PC.
+#    1. You sign in to GitHub once (private browser window, one code).
+#    2. Downloads (clones) your lab repo and opens it in a separate,
+#       clean VS Code (own settings and extensions, no saved accounts).
+#       Other VS Code windows and logins on this PC are not touched.
+#    3. When you close that VS Code: saves your work to GitHub (commit
+#       and push) and deletes the session (login, files) from this PC.
 #
 #  Double-click it again while VS Code is open to finish the session
 #  (for example if the TTPU Lab window was closed by mistake). A hidden
@@ -26,7 +27,7 @@ exit /b %errorlevel%
 # =====================================================================
 
 $Config = @{
-    Version          = '1.4.0'
+    Version          = '1.5.0'
     Org              = 'ttpu-py'
     # Client ID of the OAuth App owned by the ttpu-py organization.
     # The app must have "Enable Device Flow" switched on.
@@ -67,6 +68,8 @@ $script:SessionDir = Join-Path $script:Root 'session'
 $script:StateFile = Join-Path $script:SessionDir 'state.json'
 $script:PidFile = Join-Path $script:Root 'launcher.pid'
 $script:LogFile = Join-Path $script:Root 'ttpu-lab.log'
+# Extensions of the lab VS Code only (kept between sessions, separate from the PC's normal VS Code).
+$script:ExtDir = Join-Path $script:Root 'vscode-extensions'
 $script:Git = $null
 $script:Code = $null
 $script:Token = $null
@@ -76,6 +79,8 @@ $script:ExtensionsFailed = $false
 $script:Protected = $false
 $script:BackupBranch = $null
 $script:Phase = 'setup'
+$script:GitName = $null
+$script:GitEmail = $null
 
 # ---------------------------------------------------------------- output
 
@@ -158,7 +163,7 @@ function Find-Code {
     return $null
 }
 
-# Returns the full path of a working Python 3.9+ python.exe with sqlite3 (not the Microsoft Store stub), or $null.
+# Returns the full path of a working Python 3.9+ python.exe (not the Microsoft Store stub), or $null.
 function Find-Python {
     $cands = @()
     foreach ($c in @(Get-Command python.exe -All -ErrorAction SilentlyContinue)) {
@@ -174,7 +179,7 @@ function Find-Python {
         if (-not (Test-Path -LiteralPath $p)) { continue }
         $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
         try {
-            $out = & $p -c "import sys, sqlite3; print(sys.version_info >= (3, 9))" 2>$null
+            $out = & $p -c "import sys; print(sys.version_info >= (3, 9))" 2>$null
             if ("$out".Trim() -eq 'True') { return $p }
         } catch { Write-Log "python check failed for ${p}: $_" } finally { $ErrorActionPreference = $old }
     }
@@ -322,14 +327,15 @@ function Ensure-Extensions([string]$RepoDir) {
     $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
     try {
         $env:ELECTRON_NO_ATTACH_CONSOLE = $null
-        $have = @(& $cli --list-extensions 2>$null | ForEach-Object { "$_".Trim().ToLower() })
+        New-Item -ItemType Directory -Path $script:ExtDir -Force | Out-Null
+        $have = @(& $cli --extensions-dir $script:ExtDir --list-extensions 2>$null | ForEach-Object { "$_".Trim().ToLower() })
         $missing = @($want | Where-Object { $have -notcontains $_ })
         if ($missing.Count -eq 0) { return }
-        Step 'Installing VS Code extensions (only the first time on this PC)'
+        Step 'Installing VS Code extensions for TTPU Lab (only the first time on this PC)'
         foreach ($e in $missing) {
             Say "  $e ..."
-            $out = & $cli --install-extension $e --force 2>&1
-            $have = @(& $cli --list-extensions 2>$null | ForEach-Object { "$_".Trim().ToLower() })
+            $out = & $cli --extensions-dir $script:ExtDir --install-extension $e --force 2>&1
+            $have = @(& $cli --extensions-dir $script:ExtDir --list-extensions 2>$null | ForEach-Object { "$_".Trim().ToLower() })
             if ($have -contains $e) { Ok $e; continue }
             Write-Log "extension $e failed: $($out -join ' ')"
             Warn "Could not install $e (no connection to the extension store?). Skipping extensions for now."
@@ -374,29 +380,6 @@ function Api([string]$Path, [string]$Method = 'GET', $Body = $null) {
 
 # ------------------------------------------------- Windows credentials
 
-function Remove-WindowsGitHubCredentials {
-    $n = 0
-    # cmdkey prints "...target=<name>"; the "target=" part is the same in every Windows language.
-    try {
-        $lines = @(cmdkey.exe /list 2>$null)
-        foreach ($l in $lines) {
-            if ($l -match 'target=(.*github.*)$') {
-                $t = $Matches[1].Trim()
-                cmdkey.exe "/delete:$t" | Out-Null
-                Write-Log "removed credential $t"
-                $n++
-            }
-        }
-    } catch { Write-Log "cmdkey failed: $_" }
-    # Ask Git Credential Manager (and any other global helper) to forget github.com.
-    if ($script:Git) {
-        for ($i = 0; $i -lt 3; $i++) {
-            [void](Run-Git @('credential', 'reject') -InputText "protocol=https`nhost=github.com`n`n")
-        }
-    }
-    return $n
-}
-
 # ---------------------------------------------------------- PC cleanup
 
 function Remove-Dir([string]$Path) {
@@ -407,73 +390,9 @@ function Remove-Dir([string]$Path) {
     }
 }
 
-function Confirm-LabPC {
-    if ($script:Safe) { return }
-    $marker = Join-Path $script:Root 'lab-pc.txt'
-    if (Test-Path -LiteralPath $marker) { return }
-    Say ''
-    Warn 'TTPU Lab is made for SHARED university PCs.'
-    Warn 'Each time it runs, it removes ALL GitHub logins and the global git name/e-mail'
-    Warn 'from this Windows account, and it closes VS Code.'
-    if (-not (Ask-YesNo 'Is this a shared university lab PC?' $false)) {
-        Warn 'OK. Running in safe mode: logins on this PC are not removed.'
-        $script:Safe = $true
-        return
-    }
-    New-Item -ItemType Directory -Path $script:Root -Force | Out-Null
-    Set-Content -Path $marker -Value ("Confirmed as a lab PC on {0:yyyy-MM-dd HH:mm}" -f (Get-Date))
-}
-
-function Stop-AllVSCode {
-    $procs = @(Get-Process -Name 'Code' -ErrorAction SilentlyContinue)
-    if ($procs.Count -eq 0) { return }
-    Warn 'VS Code is open. It will be closed now (it can be from the previous student).'
-    foreach ($p in $procs) { try { if ($p.MainWindowHandle -ne 0) { [void]$p.CloseMainWindow() } } catch { } }
-    for ($i = 0; $i -lt 15 -and @(Get-Process -Name 'Code' -ErrorAction SilentlyContinue).Count -gt 0; $i++) { Start-Sleep -Seconds 1 }
-    Get-Process -Name 'Code' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 1
-}
-
-function Clear-VSCodeDefaultGitHubLogin {
-    $db = Join-Path $env:APPDATA 'Code\User\globalStorage\state.vscdb'
-    if (-not (Test-Path -LiteralPath $db)) { return }
-    $py = Find-Python
-    if (-not $py) { Write-Log 'no python: VS Code GitHub login not cleared'; return }
-    $pyFile = Join-Path $env:TEMP 'ttpu-clear-vscode.py'
-    $code = @'
-import sqlite3, sys
-con = sqlite3.connect(sys.argv[1], timeout=5)
-cur = con.execute("DELETE FROM ItemTable WHERE key LIKE 'secret://%github%' OR key LIKE 'github.%account%'")
-con.commit()
-print(cur.rowcount)
-'@
-    Set-Content -Path $pyFile -Value $code -Encoding ASCII
-    $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-    try { $out = & $py $pyFile $db 2>&1; Write-Log "vscode default profile github secrets removed: $out" } catch { } finally { $ErrorActionPreference = $old }
-    Remove-Item $pyFile -Force -ErrorAction SilentlyContinue
-}
-
-function Remove-GitHubLinesFromFile([string]$Path) {
-    if (-not (Test-Path -LiteralPath $Path)) { return }
-    $keep = @(Get-Content -LiteralPath $Path | Where-Object { $_ -notmatch 'github\.com' })
-    if ($keep.Count -eq 0) { Remove-Item -LiteralPath $Path -Force } else { Set-Content -LiteralPath $Path -Value $keep }
-}
-
-function Clear-PCLogins {
-    if ($script:Safe) { Warn 'Safe mode: machine-wide logins are not changed.'; return }
-    Stop-AllVSCode
-    $n = Remove-WindowsGitHubCredentials
-    Remove-GitHubLinesFromFile (Join-Path $env:USERPROFILE '.git-credentials')
-    Remove-GitHubLinesFromFile (Join-Path $env:USERPROFILE '.config\git\credentials')
-    $ghHosts = Join-Path $env:APPDATA 'GitHub CLI\hosts.yml'
-    if (Test-Path -LiteralPath $ghHosts) { Remove-Item -LiteralPath $ghHosts -Force -ErrorAction SilentlyContinue }
-    Clear-VSCodeDefaultGitHubLogin
-    if ($script:Git) {
-        [void](Run-Git @('config', '--global', '--unset-all', 'user.name'))
-        [void](Run-Git @('config', '--global', '--unset-all', 'user.email'))
-    }
+# The device code was copied for the student. Do not leave it on the clipboard.
+function Clear-Clipboard {
     try { Set-Clipboard -Value ' ' } catch { }
-    Write-Log "PC logins cleared ($n Windows credentials)"
 }
 
 # ------------------------------------------------------------- session
@@ -641,7 +560,7 @@ function Finish-Session([bool]$Interactive) {
         Start-Sleep -Seconds 1
     }
     Remove-Dir $script:SessionDir
-    Clear-PCLogins
+    Clear-Clipboard
     if (Test-Path -LiteralPath $script:SessionDir) { Warn "Some files could not be deleted: $script:SessionDir" } else { Ok 'Session files deleted.' }
     if ($Interactive) {
         Say ''
@@ -867,6 +786,7 @@ function Clone-Repo($Repo, $Me) {
     [IO.File]::AppendAllText((Join-Path $dir '.git\config'), $cfg, (New-Object Text.UTF8Encoding $false))
     $email = "{0}+{1}@users.noreply.github.com" -f $Me.id, $Me.login
     $uname = if ($Me.name) { $Me.name } else { $Me.login }
+    $script:GitName = $uname; $script:GitEmail = $email
     [void](Run-Git @('config', 'user.name', $uname) $dir)
     [void](Run-Git @('config', 'user.email', $email) $dir)
     [void](Run-Git @('config', 'push.default', 'current') $dir)
@@ -917,13 +837,43 @@ function Open-VSCode([string]$Dir) {
     if ($Config.DisableAI) { $settings['chat.disableAIFeatures'] = $true; $settings['github.copilot.enable'] = @{ '*' = $false } }
     Ensure-Extensions $Dir
     $settings | ConvertTo-Json -Depth 4 | Set-Content -Path (Join-Path $userDir 'settings.json') -Encoding UTF8
+    $gitConfig = Write-SessionGitConfig $Dir
     $readme = Join-Path $Dir 'README.md'
-    $args2 = @('--user-data-dir', "`"$profileDir`"", '--new-window', "`"$Dir`"")
+    $args2 = @('--user-data-dir', "`"$profileDir`"", '--extensions-dir', "`"$script:ExtDir`"", '--new-window', "`"$Dir`"")
     if (Test-Path -LiteralPath $readme) { $args2 += "`"$readme`"" }
     # Keep VS Code's own log messages out of this window.
     $env:ELECTRON_NO_ATTACH_CONSOLE = '1'
-    Start-Process -FilePath $script:Code -ArgumentList $args2 | Out-Null
+    # Git in the lab VS Code (also its terminal) reads the session config instead of the PC user's
+    # global config: only this student's login and name, never the PC's saved logins (Git 2.32+).
+    if ($gitConfig) { $env:GIT_CONFIG_GLOBAL = $gitConfig }
+    try { Start-Process -FilePath $script:Code -ArgumentList $args2 | Out-Null }
+    finally { Remove-Item Env:GIT_CONFIG_GLOBAL -ErrorAction SilentlyContinue }
     return $profileDir
+}
+
+# Writes the session's own git config: student name/e-mail and this session's login only.
+function Write-SessionGitConfig([string]$Dir) {
+    try {
+        $credFile = Join-Path $script:SessionDir 'git-credentials'
+        if (-not (Test-Path -LiteralPath $credFile)) { return $null }
+        $name = $script:GitName; $email = $script:GitEmail
+        if (-not $name) { $name = (Run-Git @('config', 'user.name') $Dir).Out.Trim() }
+        if (-not $email) { $email = (Run-Git @('config', 'user.email') $Dir).Out.Trim() }
+        $q = { param($v) '"' + ($v -replace '\\', '\\' -replace '"', '\"') + '"' }
+        $lines = @(
+            '[credential]',
+            "`thelper =",
+            "`thelper = store --file '$($credFile.Replace('\', '/'))'",
+            '[user]',
+            "`tname = $(& $q $name)",
+            "`temail = $(& $q $email)",
+            '[push]',
+            "`tdefault = current"
+        )
+        $f = Join-Path $script:SessionDir 'gitconfig'
+        [IO.File]::WriteAllText($f, (($lines -join "`n") + "`n"), (New-Object Text.UTF8Encoding $false))
+        return $f
+    } catch { Write-Log "session git config failed: $_"; return $null }
 }
 
 # --------------------------------------------- protect the session window
@@ -1086,11 +1036,9 @@ function Check-Tools {
 function Start-Lab {
     Say ''
     Say "TTPU Lab $($Config.Version) - local VS Code for your lab repo" 'Cyan'
-    if ($script:Safe) { Warn 'SAFE MODE (test): old logins on this PC are not removed.' }
     if (-not $Config.ClientId) { Fail 'Teacher setup is missing (ClientId). Tell the teacher.'; Pause-End; exit 1 }
     Update-Self
     Check-Tools
-    Confirm-LabPC
     Install-Tool
 
     $active = Load-State
@@ -1111,9 +1059,6 @@ function Start-Lab {
     }
 
     Finish-Leftover
-    Step 'Removing old GitHub logins from this PC'
-    Clear-PCLogins
-    Ok 'Done.'
 
     $script:Phase = 'signin'
     $me = SignIn
@@ -1181,9 +1126,8 @@ function End-Lab {
         Say 'Closing VS Code. If it asks to save files, click Save.'
         Close-SessionCode $state
     }
-    Confirm-LabPC
     $result = 'done'
-    if ($script:Git) { $result = Finish-Session $true } else { Clear-PCLogins }
+    if ($script:Git) { $result = Finish-Session $true } else { Fail 'Git was not found, so the work could not be saved.'; $result = 'unsaved' }
     Say ''
     if ($result -eq 'done') { Say 'All done. You can leave the PC.' 'Green' }
     elseif ($result -eq 'back') { Say 'Nothing was deleted. Open the repo folder in VS Code, save your work, then double-click TTPU Lab again.' 'Yellow' }
