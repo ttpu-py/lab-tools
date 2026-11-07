@@ -1,0 +1,2 @@
+# Keep Windows line endings in the launcher.
+*.cmd -text
