@@ -27,7 +27,7 @@ exit /b %errorlevel%
 # =====================================================================
 
 $Config = @{
-    Version          = '1.5.0'
+    Version          = '1.6.0'
     Org              = 'ttpu-py'
     # Client ID of the OAuth App owned by the ttpu-py organization.
     # The app must have "Enable Device Flow" switched on.
@@ -507,22 +507,13 @@ function Finish-Session([bool]$Interactive) {
         if ($changes) {
             Say 'Changed files:'
             Say $changes 'DarkGray'
+            # Always save: commit and push without asking.
             $doCommit = $true
-            if ($Interactive) {
-                $doCommit = Ask-YesNo 'Save these changes to GitHub now (commit and push)?' $true $Config.AnswerTimeout
-            }
-            if ($doCommit) {
-                $msg = if ($Interactive) { 'Lab work ' + (Get-Date -Format 'yyyy-MM-dd HH:mm') } else { 'Auto-save: lab session was not finished ' + (Get-Date -Format 'yyyy-MM-dd HH:mm') }
-                Remove-Item -LiteralPath (Join-Path $dir '.git\index.lock') -Force -ErrorAction SilentlyContinue
-                [void](Run-Git @('add', '-A') $dir)
-                $c = Run-Git @('commit', '-m', $msg) $dir
-                if ($c.Code -eq 0) { Ok "Commit: $msg" } else { Warn "Commit failed: $($c.Out)" }
-            } else {
-                Warn 'Changes that are not committed will be deleted from this PC.'
-                if ($Interactive -and -not (Ask-YesNo 'Delete them? (answer n to go back and save)' $false)) {
-                    return 'back'
-                }
-            }
+            $msg = if ($Interactive) { 'Lab work ' + (Get-Date -Format 'yyyy-MM-dd HH:mm') } else { 'Auto-save: lab session was not finished ' + (Get-Date -Format 'yyyy-MM-dd HH:mm') }
+            Remove-Item -LiteralPath (Join-Path $dir '.git\index.lock') -Force -ErrorAction SilentlyContinue
+            [void](Run-Git @('add', '-A') $dir)
+            $c = Run-Git @('commit', '-m', $msg) $dir
+            if ($c.Code -eq 0) { Ok "Commit: $msg" } else { Warn "Commit failed: $($c.Out)" }
         }
         Remove-Item -LiteralPath (Join-Path $dir '.git\index.lock') -Force -ErrorAction SilentlyContinue
         if ($changes -and $doCommit -and (Run-Git @('status', '--porcelain') $dir).Out.Trim()) {
@@ -642,21 +633,35 @@ function Finish-Leftover {
 
 # --------------------------------------------------------- GitHub login
 
+# Path of a browser from the Windows "App Paths" registry keys (finds installs in any folder).
+function Get-AppPath([string]$ExeName) {
+    foreach ($hive in @('HKCU:', 'HKLM:', 'HKLM:\SOFTWARE\WOW6432Node')) {
+        $key = if ($hive -like '*WOW6432Node') { "$hive\Microsoft\Windows\CurrentVersion\App Paths\$ExeName" } else { "$hive\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\$ExeName" }
+        try {
+            $v = (Get-ItemProperty -LiteralPath $key -ErrorAction Stop).'(default)'
+            if ($v) { $v = $v.Trim('"'); if (Test-Path -LiteralPath $v) { return $v } }
+        } catch { }
+    }
+    return $null
+}
+
+# Opens a private (incognito) window: Edge, then Chrome, then Firefox, then Yandex, then the default browser.
 function Open-PrivateBrowser([string]$Url) {
     $browsers = @(
-        @{ Name = 'Microsoft Edge (InPrivate)'; Arg = '--inprivate'; Paths = @("${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe", "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe") },
-        @{ Name = 'Google Chrome (Incognito)'; Arg = '--incognito'; Paths = @("$env:ProgramFiles\Google\Chrome\Application\chrome.exe", "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe", "$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe") },
-        @{ Name = 'Firefox (Private)'; Arg = '-private-window'; Paths = @("$env:ProgramFiles\Mozilla Firefox\firefox.exe", "${env:ProgramFiles(x86)}\Mozilla Firefox\firefox.exe") },
-        @{ Name = 'Yandex Browser (Incognito)'; Arg = '--incognito'; Paths = @("$env:LOCALAPPDATA\Yandex\YandexBrowser\Application\browser.exe") }
+        @{ Name = 'Microsoft Edge (InPrivate)'; Arg = '--inprivate'; Exe = 'msedge.exe'; Paths = @("${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe", "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe", "$env:LOCALAPPDATA\Microsoft\Edge\Application\msedge.exe") },
+        @{ Name = 'Google Chrome (Incognito)'; Arg = '--incognito'; Exe = 'chrome.exe'; Paths = @("$env:ProgramFiles\Google\Chrome\Application\chrome.exe", "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe", "$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe") },
+        @{ Name = 'Firefox (Private)'; Arg = '-private-window'; Exe = 'firefox.exe'; Paths = @("$env:ProgramFiles\Mozilla Firefox\firefox.exe", "${env:ProgramFiles(x86)}\Mozilla Firefox\firefox.exe", "$env:LOCALAPPDATA\Mozilla Firefox\firefox.exe") },
+        @{ Name = 'Yandex Browser (Incognito)'; Arg = '--incognito'; Exe = 'browser.exe'; Paths = @("$env:LOCALAPPDATA\Yandex\YandexBrowser\Application\browser.exe", "$env:ProgramFiles\Yandex\YandexBrowser\Application\browser.exe", "${env:ProgramFiles(x86)}\Yandex\YandexBrowser\Application\browser.exe") }
     )
     foreach ($b in $browsers) {
         $exe = Find-FirstFile $b.Paths
+        if (-not $exe -and $b.Exe -ne 'browser.exe') { $exe = Get-AppPath $b.Exe }
         if ($exe) {
-            try { Start-Process -FilePath $exe -ArgumentList @($b.Arg, $Url); return $b.Name } catch { }
+            try { Start-Process -FilePath $exe -ArgumentList @($b.Arg, $Url) -ErrorAction Stop; return $b.Name } catch { Write-Log "browser failed: $exe $_" }
         }
     }
-    Start-Process $Url
-    return 'default browser'
+    try { Start-Process $Url -ErrorAction Stop; return 'default browser' } catch { Write-Log "default browser failed: $_" }
+    return $null
 }
 
 function Get-DeviceToken {
@@ -674,7 +679,8 @@ function Get-DeviceToken {
     Say '    1. Sign in with YOUR GitHub account.' 'White'
     Say '    2. Paste the code (Ctrl+V), click Continue, then click Authorize.' 'White'
     $name = Open-PrivateBrowser $dc.verification_uri
-    Say "  (opened $name at $($dc.verification_uri))" 'DarkGray'
+    if ($name) { Say "  (opened $name at $($dc.verification_uri))" 'DarkGray' }
+    else { Warn "Open this page in a browser (private window): $($dc.verification_uri)" }
     Say ''
     Say '  Waiting for you to authorize...' 'DarkGray'
     $interval = [Math]::Max(5, [int]$dc.interval)
@@ -709,13 +715,7 @@ function SignIn {
         $label = if ($me.name) { "$($me.login) ($($me.name))" } else { $me.login }
         Say ''
         Say "  Signed in as: $label" 'Green'
-        for ($k = 0; $k -lt 2; $k++) {
-            $typed = Read-Host '  To confirm, type YOUR GitHub username'
-            if ("$typed".Trim().ToLower() -eq $me.login.ToLower()) { return $me }
-            Warn "That is not '$($me.login)'."
-        }
-        Warn 'In the browser window, click your profile picture -> Sign out. Then sign in with your account.'
-        $script:Token = $null
+        return $me
     }
 }
 
